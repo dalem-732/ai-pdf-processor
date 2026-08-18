@@ -1,0 +1,32 @@
+[project]
+name = "tender-summarizer"
+version = "1.0.0"
+description = "Суммаризатор тендерной документации: PDF с госзакупок → сумма контракта, сроки, требования, штрафы"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+keywords = ["tender", "procurement", "44-fz", "pdf", "llm", "fastapi", "summarization"]
+
+[tool.pytest.ini_options]
+# Корень проекта в sys.path: приложение запускается как пакет `app`, а не
+# устанавливается, поэтому тестам нужен явный путь.
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = [
+    # Длинные строки в промптах и HTML-шаблоне разбивать вредно: теряется
+    # читаемость самого текста, который и является содержимым.
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]

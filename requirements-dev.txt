@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Test and lint tooling.
+pytest==8.3.4
+pytest-asyncio==0.25.2
+reportlab==4.2.5
+ruff==0.8.6

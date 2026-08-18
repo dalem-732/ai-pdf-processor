@@ -1,0 +1,21 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Без ключей сервис поднимается на провайдере stub и остаётся
+      # работоспособным: выжимка собирается правилами.
+      TENDER_LLM_PROVIDER: ${TENDER_LLM_PROVIDER:-stub}
+      TENDER_OPENAI_API_KEY: ${TENDER_OPENAI_API_KEY:-}
+      TENDER_OPENAI_MODEL: ${TENDER_OPENAI_MODEL:-gpt-4o-mini}
+      TENDER_ANTHROPIC_API_KEY: ${TENDER_ANTHROPIC_API_KEY:-}
+      TENDER_ANTHROPIC_MODEL: ${TENDER_ANTHROPIC_MODEL:-claude-3-5-sonnet-latest}
+      # Ollama живёт на хосте, а не в этом контейнере: локальной модели нужны
+      # ресурсы хоста и её образ переиспользуется другими сервисами.
+      TENDER_OLLAMA_BASE_URL: ${TENDER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      TENDER_OLLAMA_MODEL: ${TENDER_OLLAMA_MODEL:-qwen2.5:7b-instruct}
+      TENDER_LOG_LEVEL: ${TENDER_LOG_LEVEL:-INFO}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
