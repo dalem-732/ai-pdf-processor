@@ -142,7 +142,11 @@ UPLOAD_PAGE_HTML = """<!DOCTYPE html>
             <label for="file">PDF-файл документации</label>
             <input id="file" name="file" type="file" accept="application/pdf,.pdf" required>
           </div>
-          <div class="field-row-stacked">
+          <div class="field-row-stacked hidden" id="api-key-row">
+            <label for="api-key">API-ключ сервиса</label>
+            <input id="api-key" type="password" autocomplete="off">
+          </div>
+          <div class="field-row-stacked hidden" id="provider-row">
             <label for="provider">Провайдер LLM</label>
             <select id="provider" name="provider">
               <option value="">Из конфигурации сервиса</option>
@@ -196,6 +200,23 @@ const STAGE_LABELS = {
 
 const escape = (value) => String(value ?? '').replace(/[&<>"]/g, (ch) =>
   ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[ch]));
+
+const describeError = (payload, fallback) => {
+  const detail = payload ? payload.detail : null;
+  if (Array.isArray(detail)) {
+    return detail.map((item) => (item && item.msg) || JSON.stringify(item)).join('; ');
+  }
+  if (typeof detail === 'string' && detail) return detail;
+  return (payload && payload.error) || fallback;
+};
+
+fetch('/api/v1/health')
+  .then((response) => response.json())
+  .then((health) => {
+    if (health.provider_override_allowed) document.getElementById('provider-row').classList.remove('hidden');
+    if (health.auth_required) document.getElementById('api-key-row').classList.remove('hidden');
+  })
+  .catch(() => {});
 
 const money = (value) => {
   if (!value || value.amount === null || value.amount === undefined) return '-';
@@ -260,6 +281,8 @@ form.addEventListener('submit', async (event) => {
   data.append('file', document.getElementById('file').files[0]);
   const provider = document.getElementById('provider').value;
   if (provider) data.append('provider', provider);
+  const apiKey = document.getElementById('api-key').value.trim();
+  const headers = apiKey ? { 'X-API-Key': apiKey } : {};
 
   button.disabled = true;
   resultBox.classList.add('hidden');
@@ -267,12 +290,11 @@ form.addEventListener('submit', async (event) => {
   showProgressUI();
 
   try {
-    const response = await fetch('/api/v1/summarize/stream', { method: 'POST', body: data });
+    const response = await fetch('/api/v1/summarize/stream', { method: 'POST', body: data, headers });
     if (!response.ok) {
       let detail = `HTTP ${response.status}`;
       try {
-        const payload = await response.json();
-        detail = payload.detail || payload.error || detail;
+        detail = describeError(await response.json(), detail);
       } catch (_) {}
       statusBody.innerHTML =
         `<p class="error-text"><strong>Ошибка ${response.status}</strong></p>` +

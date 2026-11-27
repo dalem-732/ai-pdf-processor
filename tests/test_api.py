@@ -104,10 +104,13 @@ def test_request_id_echoed_from_header(client: TestClient, sample_pdf_bytes: byt
     assert response.json()["request_id"] == "trace-42"
 
 
-def test_provider_can_be_overridden_per_request(
-    client: TestClient, sample_pdf_bytes: bytes
-) -> None:
-    """Переопределение провайдера на запрос: удобно сравнить модели на одном файле."""
+def test_provider_can_be_overridden_per_request(sample_pdf_bytes: bytes) -> None:
+    """Переопределение провайдера на запрос, если сервер его явно разрешил."""
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        llm_provider="stub", allow_provider_override=True
+    )
+    client = TestClient(app)
     response = client.post(
         "/api/v1/summarize",
         files={"file": ("tender.pdf", sample_pdf_bytes, "application/pdf")},

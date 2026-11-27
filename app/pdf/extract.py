@@ -52,6 +52,10 @@ class PdfExtractionError(Exception):
     """Файл не является PDF либо не читается ни одним из бэкендов."""
 
 
+class PdfPageLimitError(PdfExtractionError):
+    """В документе больше страниц, чем разрешено настройками."""
+
+
 @dataclass(slots=True)
 class Page:
     number: int  # нумерация с единицы - как её видит человек в просмотрщике
@@ -86,7 +90,7 @@ class ExtractedDocument:
         return self.pages_with_text == 0
 
 
-def extract_text(data: bytes) -> ExtractedDocument:
+def extract_text(data: bytes, *, max_pages: int | None = None) -> ExtractedDocument:
     """Вытащить текст из байтов PDF.
 
     Порядок: pdfplumber → pypdf. Возвращается тот результат, который дал
@@ -101,11 +105,11 @@ def extract_text(data: bytes) -> ExtractedDocument:
             "Файл не похож на PDF: отсутствует сигнатура %PDF- в начале"
         )
 
-    primary = _extract_with_pdfplumber(data)
+    primary = _extract_with_pdfplumber(data, max_pages)
     if primary is not None and primary.characters >= _MIN_TOTAL_CHARS_BEFORE_FALLBACK:
         return _postprocess(primary)
 
-    fallback = _extract_with_pypdf(data)
+    fallback = _extract_with_pypdf(data, max_pages)
     candidates = [doc for doc in (primary, fallback) if doc is not None]
     if not candidates:
         raise PdfExtractionError(
@@ -115,7 +119,14 @@ def extract_text(data: bytes) -> ExtractedDocument:
     return _postprocess(best)
 
 
-def _extract_with_pdfplumber(data: bytes) -> ExtractedDocument | None:
+def _check_page_count(count: int, max_pages: int | None) -> None:
+    if max_pages is not None and count > max_pages:
+        raise PdfPageLimitError(
+            f"В документе {count} стр., а допустимо не больше {max_pages}"
+        )
+
+
+def _extract_with_pdfplumber(data: bytes, max_pages: int | None = None) -> ExtractedDocument | None:
     try:
         import pdfplumber
     except ImportError:  # pragma: no cover - зависимость объявлена в requirements
@@ -124,6 +135,7 @@ def _extract_with_pdfplumber(data: bytes) -> ExtractedDocument | None:
 
     try:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
+            _check_page_count(len(pdf.pages), max_pages)
             pages: list[Page] = []
             for index, page in enumerate(pdf.pages, start=1):
                 parts: list[str] = []
@@ -133,6 +145,8 @@ def _extract_with_pdfplumber(data: bytes) -> ExtractedDocument | None:
                 parts.extend(_render_tables(page))
                 pages.append(Page(number=index, text="\n".join(parts).strip()))
         return ExtractedDocument(pages=pages, extractor="pdfplumber")
+    except (PdfPageLimitError, MemoryError):
+        raise
     except Exception as exc:  # noqa: BLE001 - хотим fallback на любой сбой парсера
         logger.warning("pdfplumber не смог разобрать документ: %s", exc)
         return None
@@ -166,7 +180,7 @@ def _render_tables(page: object) -> list[str]:
     return rendered
 
 
-def _extract_with_pypdf(data: bytes) -> ExtractedDocument | None:
+def _extract_with_pypdf(data: bytes, max_pages: int | None = None) -> ExtractedDocument | None:
     try:
         from pypdf import PdfReader
     except ImportError:  # pragma: no cover
@@ -182,11 +196,14 @@ def _extract_with_pypdf(data: bytes) -> ExtractedDocument | None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("PDF зашифрован и не открывается пустым паролем: %s", exc)
                 return None
+        _check_page_count(len(reader.pages), max_pages)
         pages = [
             Page(number=index, text=(page.extract_text() or "").strip())
             for index, page in enumerate(reader.pages, start=1)
         ]
         return ExtractedDocument(pages=pages, extractor="pypdf")
+    except (PdfPageLimitError, MemoryError):
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("pypdf не смог разобрать документ: %s", exc)
         return None
