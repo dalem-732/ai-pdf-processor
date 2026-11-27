@@ -36,7 +36,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pydantic import ValidationError
 from tenacity import (
@@ -49,22 +49,24 @@ from tenacity import (
 from app.config import Settings
 from app.core.chunking import Chunk, build_chunks, build_marked_text, select_chunks
 from app.core.json_utils import JsonParseError, parse_json_object
-from app.core.heuristics import heuristic_summary
 from app.core.merge import merge_summaries, refine_summary, score_confidence
 from app.core.prompts import SYSTEM_PROMPT, build_extraction_prompt
 from app.core.validation import verify_and_enrich
-from app.errors import NoTextLayerError, ProviderUnavailableError, UnreadablePdfError
+from app.errors import (
+    NoTextLayerError,
+    PdfTooComplexError,
+    ProviderUnavailableError,
+    TooManyPagesError,
+    UnreadablePdfError,
+)
 from app.llm.base import LLMClient, LLMError, LLMRequest, LLMResult
-from app.pdf.extract import PdfExtractionError, extract_text
+from app.pdf.extract import PdfExtractionError, PdfPageLimitError
+from app.pdf.isolation import PdfResourceError, PdfTimeoutError, extract_text_isolated
 from app.schemas import DocumentMeta, LLMUsage, TenderSummary
 
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, str, str | None], Awaitable[None]]
-
-# Три параллельных запроса - компромисс: облако при большем числе чаще
-# отвечает 429, а локальная Ollama на одной GPU всё равно обрабатывает их по очереди.
-MAX_CONCURRENT_LLM_CALLS = 3
 
 
 @dataclass(slots=True)
@@ -73,6 +75,15 @@ class PipelineResult:
     llm: LLMUsage
     summary: TenderSummary
     elapsed_ms: int
+
+
+@dataclass(slots=True)
+class _ExtractionOutcome:
+    partials: list[TenderSummary] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    truncated: int = 0
 
 
 async def summarize_pdf(
@@ -93,9 +104,16 @@ async def summarize_pdf(
     await emit(2, "extract", "Чтение PDF")
 
     try:
-        # Разбор PDF - чистый CPU и десятки секунд на большом файле. В event
-        # loop он бы заблокировал все параллельные запросы сервиса.
-        document = await asyncio.to_thread(extract_text, content)
+        document = await extract_text_isolated(
+            content,
+            max_pages=settings.max_pages,
+            timeout_seconds=settings.pdf_parse_timeout_seconds,
+            memory_mb=settings.pdf_parse_memory_mb,
+        )
+    except PdfPageLimitError as exc:
+        raise TooManyPagesError(str(exc)) from exc
+    except (PdfTimeoutError, PdfResourceError) as exc:
+        raise PdfTooComplexError(str(exc)) from exc
     except PdfExtractionError as exc:
         raise UnreadablePdfError(str(exc)) from exc
 
@@ -126,55 +144,42 @@ async def summarize_pdf(
         chunk_chars=settings.chunk_chars,
         overlap_chars=settings.chunk_overlap_chars,
     )
-    selected = select_chunks(all_chunks, max_chunks=settings.max_chunks)
     marked_text = build_marked_text(document)
-
+    selected = _apply_char_budget(
+        select_chunks(all_chunks, max_chunks=settings.max_chunks),
+        settings.max_llm_input_chars,
+    )
     await emit(
         18,
         "chunk",
         f"Отобрано {len(selected)} из {len(all_chunks)} фрагментов",
     )
 
-    if client.name == "stub":
+    direct = await asyncio.to_thread(client.summarize_document, marked_text)
+    if direct is not None:
         logger.info(
-            "request_id=%s страниц=%d символов=%d провайдер=stub (полный документ)",
+            "request_id=%s страниц=%d символов=%d провайдер=%s (полный документ)",
             request_id,
             meta.pages,
             meta.characters,
+            client.name,
         )
-        await emit(25, "llm", "Анализ правилами")
-        summary = await asyncio.to_thread(heuristic_summary, marked_text)
         await emit(70, "llm", "Правила отработали")
-        await emit(75, "verify", "Сверка значений")
-        summary = await asyncio.to_thread(verify_and_enrich, summary, marked_text)
-        await emit(90, "finish", "Очистка выжимки")
-        summary = refine_summary(summary)
-        summary.confidence = score_confidence(
-            summary,
-            chunks_sent=len(all_chunks),
-            chunks_total=len(all_chunks),
-        )
-        await emit(100, "finish", "Готово")
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        llm_usage = LLMUsage(
+        usage = LLMUsage(
             provider=client.name,
             model=client.model,
             chunks_total=len(all_chunks),
             chunks_sent=len(all_chunks),
             calls=0,
-            prompt_tokens=None,
-            completion_tokens=None,
         )
-        logger.info(
-            "request_id=%s готово за %d мс, confidence=%.2f, требований=%d, штрафов=%d",
-            request_id,
-            elapsed_ms,
-            summary.confidence,
-            len(summary.requirements),
-            len(summary.penalties),
-        )
-        return PipelineResult(
-            document=meta, llm=llm_usage, summary=summary, elapsed_ms=elapsed_ms
+        return await _finalize(
+            direct,
+            marked_text=marked_text,
+            meta=meta,
+            usage=usage,
+            request_id=request_id,
+            started=started,
+            emit=emit,
         )
 
     logger.info(
@@ -187,7 +192,7 @@ async def summarize_pdf(
         client.name,
     )
 
-    partials, failures, usage_totals = await _run_extraction(
+    outcome = await _run_extraction(
         client=client,
         chunks=selected,
         settings=settings,
@@ -195,49 +200,75 @@ async def summarize_pdf(
         progress=progress,
     )
 
-    if not partials:
+    if not outcome.partials:
         raise ProviderUnavailableError(
             "Ни один фрагмент документа не удалось обработать моделью: "
-            + "; ".join(failures[:3])
+            + "; ".join(outcome.failures[:3])
+            + f". Подробности в логах сервера (request_id={request_id})"
         )
 
     await emit(88, "merge", "Слияние фрагментов")
-    summary = merge_summaries(partials)
-    if len(partials) < len(selected):
+    summary = merge_summaries(outcome.partials)
+    if len(outcome.partials) < len(selected):
         summary.warnings.append(
-            f"Обработано {len(partials)} из {len(selected)} фрагментов документа: "
+            f"Обработано {len(outcome.partials)} из {len(selected)} фрагментов документа: "
             "часть запросов к модели завершилась ошибкой, выжимка может быть неполной"
         )
     if len(selected) < len(all_chunks):
         summary.warnings.append(
             f"В модель отправлено {len(selected)} из {len(all_chunks)} фрагментов "
-            "(отобраны наиболее релевантные); увеличьте TENDER_MAX_CHUNKS для "
-            "полного разбора"
+            "(отобраны наиболее релевантные); увеличьте TENDER_MAX_CHUNKS или "
+            "TENDER_MAX_LLM_INPUT_CHARS для полного разбора"
+        )
+    if outcome.truncated:
+        summary.warnings.append(
+            f"Ответ модели оборвался на лимите выходных токенов во фрагментах: "
+            f"{outcome.truncated}; часть фактов могла потеряться, увеличьте "
+            "TENDER_LLM_MAX_OUTPUT_TOKENS"
         )
 
-    # Сверка гоняет регулярки по всему документу - тоже CPU-bound.
+    usage = LLMUsage(
+        provider=client.name,
+        model=client.model,
+        chunks_total=len(all_chunks),
+        chunks_sent=len(selected),
+        calls=len(outcome.partials) + len(outcome.failures),
+        prompt_tokens=outcome.prompt_tokens,
+        completion_tokens=outcome.completion_tokens,
+        truncated_responses=outcome.truncated,
+    )
+    return await _finalize(
+        summary,
+        marked_text=marked_text,
+        meta=meta,
+        usage=usage,
+        request_id=request_id,
+        started=started,
+        emit=emit,
+    )
+
+
+async def _finalize(
+    summary: TenderSummary,
+    *,
+    marked_text: str,
+    meta: DocumentMeta,
+    usage: LLMUsage,
+    request_id: str,
+    started: float,
+    emit: Callable[[int, str, str | None], Awaitable[None]],
+) -> PipelineResult:
     await emit(92, "verify", "Сверка с документом")
     summary = await asyncio.to_thread(verify_and_enrich, summary, marked_text)
     await emit(97, "finish", "Очистка выжимки")
     summary = refine_summary(summary)
     summary.confidence = score_confidence(
         summary,
-        chunks_sent=len(selected),
-        chunks_total=len(all_chunks),
+        chunks_sent=usage.chunks_sent,
+        chunks_total=usage.chunks_total,
     )
     await emit(100, "finish", "Готово")
-
-    llm_usage = LLMUsage(
-        provider=client.name,
-        model=client.model,
-        chunks_total=len(all_chunks),
-        chunks_sent=len(selected),
-        calls=len(partials) + len(failures),
-        prompt_tokens=usage_totals.get("prompt"),
-        completion_tokens=usage_totals.get("completion"),
-    )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
-
     logger.info(
         "request_id=%s готово за %d мс, confidence=%.2f, требований=%d, штрафов=%d",
         request_id,
@@ -246,9 +277,22 @@ async def summarize_pdf(
         len(summary.requirements),
         len(summary.penalties),
     )
-    return PipelineResult(
-        document=meta, llm=llm_usage, summary=summary, elapsed_ms=elapsed_ms
-    )
+    return PipelineResult(document=meta, llm=usage, summary=summary, elapsed_ms=elapsed_ms)
+
+
+def _apply_char_budget(chunks: list[Chunk], budget: int) -> list[Chunk]:
+    """Ограничить суммарный объём текста, уходящего в модель за один запрос."""
+    if not chunks:
+        return chunks
+    ranked = [chunks[0]] + sorted(chunks[1:], key=lambda chunk: chunk.score, reverse=True)
+    kept: list[Chunk] = []
+    used = 0
+    for chunk in ranked:
+        if kept and used + len(chunk.text) > budget:
+            continue
+        kept.append(chunk)
+        used += len(chunk.text)
+    return sorted(kept, key=lambda chunk: chunk.index)
 
 
 async def _run_extraction(
@@ -258,9 +302,9 @@ async def _run_extraction(
     settings: Settings,
     request_id: str,
     progress: ProgressCallback | None = None,
-) -> tuple[list[TenderSummary], list[str], dict[str, int | None]]:
+) -> _ExtractionOutcome:
     """Стадия map: параллельно извлечь факты из каждого фрагмента."""
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
+    semaphore = asyncio.Semaphore(settings.llm_concurrency)
     progress_lock = asyncio.Lock()
     completed_chunks = 0
     llm_start = 20
@@ -304,7 +348,7 @@ async def _run_extraction(
                     exc,
                 )
                 await report_chunk_done(chunk)
-                return None, f"{chunk.label}: {exc}", None
+                return None, f"{chunk.label}: {exc.public_message}", None
 
         try:
             payload = parse_json_object(result.text)
@@ -323,30 +367,23 @@ async def _run_extraction(
 
     outcomes = await asyncio.gather(*(worker(chunk) for chunk in chunks))
 
-    partials: list[TenderSummary] = []
-    failures: list[str] = []
-    prompt_tokens = 0
-    completion_tokens = 0
-    saw_tokens = False
-
+    outcome = _ExtractionOutcome()
     for summary, failure, result in outcomes:
         if summary is not None:
-            partials.append(summary)
+            outcome.partials.append(summary)
         if failure is not None:
-            failures.append(failure)
-        if result is not None:
-            if result.prompt_tokens:
-                prompt_tokens += result.prompt_tokens
-                saw_tokens = True
-            if result.completion_tokens:
-                completion_tokens += result.completion_tokens
-                saw_tokens = True
-
-    usage = {
-        "prompt": prompt_tokens if saw_tokens else None,
-        "completion": completion_tokens if saw_tokens else None,
-    }
-    return partials, failures, usage
+            outcome.failures.append(failure)
+        if result is None:
+            continue
+        if result.truncated:
+            outcome.truncated += 1
+        if result.prompt_tokens:
+            outcome.prompt_tokens = (outcome.prompt_tokens or 0) + result.prompt_tokens
+        if result.completion_tokens:
+            outcome.completion_tokens = (
+                outcome.completion_tokens or 0
+            ) + result.completion_tokens
+    return outcome
 
 
 async def _complete_with_retries(

@@ -19,6 +19,8 @@ from typing import Any
 
 import httpx
 
+from app.schemas import TenderSummary
+
 logger = logging.getLogger(__name__)
 
 # Коды, при которых повтор запроса осмыслен: троттлинг и сбои на стороне
@@ -31,20 +33,22 @@ class LLMError(Exception):
 
     ``retryable`` отличает временный сбой (сеть, троттлинг) от постоянного
     (неверный ключ, несуществующая модель) - от этого зависит, стоит ли
-    повторять запрос и какой HTTP-код вернуть клиенту.
+    повторять запрос и какой HTTP-код вернуть клиенту. ``public_message`` -
+    безопасный текст для клиента, без тела ответа провайдера и адресов.
     """
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self, message: str, *, retryable: bool = False, public_message: str | None = None
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.public_message = public_message or message
 
 
 @dataclass(slots=True)
 class LLMRequest:
     system: str
     user: str
-    # Текст части документа в чистом виде. Нужен только stub-провайдеру,
-    # который вместо генерации применяет к нему регулярные эвристики.
     document_text: str = ""
 
 
@@ -54,6 +58,7 @@ class LLMResult:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     meta: dict[str, Any] = field(default_factory=dict)
+    truncated: bool = False
 
 
 class LLMClient(ABC):
@@ -66,10 +71,26 @@ class LLMClient(ABC):
         self.timeout = timeout
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
+        self._http: Any = None
 
     @abstractmethod
     async def complete(self, request: LLMRequest) -> LLMResult:
         """Выполнить один вызов модели и вернуть сырой текст ответа."""
+
+    def summarize_document(self, marked_text: str) -> TenderSummary | None:
+        """Собрать выжимку по всему документу без вызовов модели, если клиент это умеет."""
+        return None
+
+    async def aclose(self) -> None:
+        http, self._http = self._http, None
+        close = getattr(http, "aclose", None)
+        if close is not None:
+            await close()
+
+    def _client(self) -> Any:
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=self.timeout)
+        return self._http
 
     async def _post(
         self,
@@ -80,15 +101,16 @@ class LLMClient(ABC):
     ) -> dict[str, Any]:
         """POST с JSON-телом и приведением ошибок к ``LLMError``."""
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(url, json=payload, headers=headers)
+            response = await self._client().post(url, json=payload, headers=headers)
         except httpx.TimeoutException as exc:
             raise LLMError(
                 f"Таймаут запроса к {self.name} ({self.timeout:.0f} c)", retryable=True
             ) from exc
         except httpx.HTTPError as exc:
             raise LLMError(
-                f"Сетевая ошибка при обращении к {self.name}: {exc}", retryable=True
+                f"Сетевая ошибка при обращении к {self.name}: {exc}",
+                retryable=True,
+                public_message=f"Сетевая ошибка при обращении к {self.name}",
             ) from exc
 
         if response.status_code >= 400:
@@ -96,11 +118,19 @@ class LLMClient(ABC):
             raise LLMError(
                 f"{self.name} вернул HTTP {response.status_code}: {snippet}",
                 retryable=response.status_code in RETRYABLE_STATUS_CODES,
+                public_message=f"{self.name} вернул HTTP {response.status_code}",
             )
 
         try:
             return response.json()
         except ValueError as exc:
             raise LLMError(
-                f"{self.name} вернул не-JSON ответ: {response.text[:300]}"
+                f"{self.name} вернул не-JSON ответ: {response.text[:300]}",
+                public_message=f"{self.name} вернул не-JSON ответ",
             ) from exc
+
+    def _unexpected_structure(self, vendor: str, data: object) -> LLMError:
+        return LLMError(
+            f"Неожиданная структура ответа {vendor}: {str(data)[:500]}",
+            public_message=f"Неожиданная структура ответа {vendor}",
+        )

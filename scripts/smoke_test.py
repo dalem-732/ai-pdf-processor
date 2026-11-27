@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import sys
 from pathlib import Path
@@ -73,10 +74,15 @@ def _print_summary(summary: TenderSummary) -> None:
 
 
 async def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Прогнать PDF через пайплайн с провайдером из настроек"
+    )
+    parser.add_argument("pdf", nargs="?", help="путь к PDF; без него собирается демонстрационный")
+    args = parser.parse_args()
     settings = get_settings()
 
-    if len(sys.argv) > 1:
-        pdf_path = Path(sys.argv[1])
+    if args.pdf:
+        pdf_path = Path(args.pdf)
         if not pdf_path.is_file():
             print(f"Файл не найден: {pdf_path}", file=sys.stderr)
             return 1

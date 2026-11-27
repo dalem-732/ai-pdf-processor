@@ -11,7 +11,7 @@ PDF, структурно похожий на документацию по 44-�
 
 from __future__ import annotations
 
-import sys
+import argparse
 from pathlib import Path
 
 # Пути, по которым в Linux/macOS обычно лежит шрифт с кириллицей.
@@ -250,9 +250,18 @@ def build_sample_pdf(path: str | Path) -> Path:
     return target
 
 
-def main() -> int:
-    destination = sys.argv[1] if len(sys.argv) > 1 else "tmp/sample_tender.pdf"
-    path = build_sample_pdf(destination)
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Собрать демонстрационный PDF тендерной документации"
+    )
+    parser.add_argument(
+        "destination",
+        nargs="?",
+        default="tmp/sample_tender.pdf",
+        help="куда сохранить PDF (по умолчанию tmp/sample_tender.pdf)",
+    )
+    args = parser.parse_args(argv)
+    path = build_sample_pdf(args.destination)
     print(f"PDF собран: {path.resolve()} ({path.stat().st_size} байт)")
     return 0
 

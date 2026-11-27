@@ -9,18 +9,20 @@
 
 | Пакет | Версия | Лицензия | Роль в проекте |
 |-------|--------|----------|----------------|
-| fastapi | 0.115.6 | MIT | HTTP-слой, генерация OpenAPI |
-| uvicorn | 0.34.0 | BSD-3-Clause | ASGI-сервер |
-| python-multipart | 0.0.20 | Apache-2.0 | Разбор multipart-загрузки файла |
-| pydantic | 2.10.4 | MIT | Схемы данных и валидация ответа модели |
-| pydantic-settings | 2.7.1 | MIT | Настройки из окружения |
-| httpx | 0.28.1 | BSD-3-Clause | HTTP-клиент ко всем LLM-провайдерам |
-| pdfplumber | 0.11.5 | MIT | Основной экстрактор текста и таблиц |
-| pypdf | 5.1.0 | BSD-3-Clause | Резервный экстрактор текста |
-| tenacity | 9.0.0 | Apache-2.0 | Повторы при восстановимых сбоях сети |
+| fastapi | 0.165.0 | MIT | HTTP-слой, генерация OpenAPI |
+| starlette | 1.10.0 | BSD-3-Clause | ASGI-основа FastAPI, закреплена явно ради исправлений безопасности |
+| uvicorn | 0.54.0 | BSD-3-Clause | ASGI-сервер |
+| python-multipart | 0.0.34 | Apache-2.0 | Разбор multipart-загрузки файла |
+| pydantic | 2.14.4 | MIT | Схемы данных и валидация ответа модели |
+| pydantic-settings | 2.16.3 | MIT | Настройки из окружения |
+| httpx | 0.29.0 | BSD-3-Clause | HTTP-клиент ко всем LLM-провайдерам |
+| pdfplumber | 0.11.11 | MIT | Основной экстрактор текста и таблиц |
+| pdfminer.six | 20260107 | MIT | Парсер PDF под pdfplumber, закреплён явно ради исправлений безопасности |
+| pypdf | 7.2.0 | BSD-3-Clause | Резервный экстрактор текста |
+| tenacity | 9.2.1 | Apache-2.0 | Повторы при восстановимых сбоях сети |
 
-Транзитивно подтягиваются `starlette` (BSD-3-Clause), `pdfminer.six`
-(MIT), `pillow` (MIT-CMU), `anyio` (MIT), `certifi` (MPL-2.0),
+Транзитивно подтягиваются `pypdfium2` (BSD-3-Clause / Apache-2.0),
+`pillow` (MIT-CMU), `anyio` (MIT), `certifi` (MPL-2.0),
 `charset-normalizer` (MIT), `cryptography` (Apache-2.0 / BSD-3-Clause).
 Все они разрешают использование в MIT-проекте при сохранении текстов лицензий
 в поставке пакетов.
@@ -29,10 +31,12 @@
 
 | Пакет | Версия | Лицензия | Роль |
 |-------|--------|----------|------|
-| pytest | 8.3.4 | MIT | Тесты |
-| pytest-asyncio | 0.25.2 | Apache-2.0 | Асинхронные тесты |
-| reportlab | 4.2.5 | BSD-3-Clause | Генерация тестового PDF |
-| ruff | 0.8.6 | MIT | Линтер и форматтер |
+| pytest | 9.2.0 | MIT | Тесты |
+| pytest-asyncio | 1.5.0 | Apache-2.0 | Асинхронные тесты |
+| httpx2 | 2.16.2 | BSD-3-Clause | Транспорт TestClient в Starlette 1.x |
+| reportlab | 5.1.2 | BSD-3-Clause | Генерация тестового PDF |
+| ruff | 0.17.6 | MIT | Линтер и форматтер |
+| pip-audit | 2.10.1 | Apache-2.0 | Проверка зависимостей на известные уязвимости |
 
 ## Данные и модели
 

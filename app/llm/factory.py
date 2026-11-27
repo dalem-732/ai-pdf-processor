@@ -47,6 +47,7 @@ def build_client(settings: Settings) -> LLMClient:
         return OllamaClient(
             base_url=settings.ollama_base_url,
             model=settings.ollama_model,
+            num_ctx=settings.ollama_num_ctx,
             **common,
         )
 
