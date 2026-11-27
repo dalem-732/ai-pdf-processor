@@ -6,7 +6,7 @@ OpenRouter) - достаточно переопределить ``TENDER_OPENAI_
 
 from __future__ import annotations
 
-from app.llm.base import LLMClient, LLMError, LLMRequest, LLMResult
+from app.llm.base import LLMClient, LLMRequest, LLMResult
 
 
 class OpenAIClient(LLMClient):
@@ -42,12 +42,14 @@ class OpenAIClient(LLMClient):
         try:
             text = data["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError) as exc:
-            raise LLMError(f"Неожиданная структура ответа OpenAI: {data}") from exc
+            raise self._unexpected_structure("OpenAI", data) from exc
 
         usage = data.get("usage") or {}
+        finish_reason = data["choices"][0].get("finish_reason")
         return LLMResult(
             text=text,
             prompt_tokens=usage.get("prompt_tokens"),
             completion_tokens=usage.get("completion_tokens"),
-            meta={"finish_reason": data["choices"][0].get("finish_reason")},
+            meta={"finish_reason": finish_reason},
+            truncated=finish_reason == "length",
         )

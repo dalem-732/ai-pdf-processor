@@ -2,13 +2,14 @@ PYTHON ?= python3
 VENV   ?= .venv
 BIN     = $(VENV)/bin
 
-.PHONY: help venv install install-dev run test lint fmt smoke clean
+.PHONY: help venv install install-dev run test lint audit fmt smoke clean
 
 help:
 	@echo "make install-dev  - создать venv и установить зависимости для разработки"
 	@echo "make run          - поднять API на http://localhost:8000 (docs: /docs)"
 	@echo "make test         - прогнать pytest"
 	@echo "make lint         - проверить код ruff"
+	@echo "make audit        - проверить зависимости pip-audit"
 	@echo "make smoke        - собрать тестовый PDF и прогнать его через /summarize (provider=stub)"
 
 venv:
@@ -29,6 +30,9 @@ test:
 
 lint:
 	$(BIN)/ruff check app tests scripts
+
+audit:
+	$(BIN)/pip-audit -r requirements.txt
 
 fmt:
 	$(BIN)/ruff format app tests scripts

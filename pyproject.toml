@@ -1,6 +1,6 @@
 [project]
 name = "tender-summarizer"
-version = "1.0.0"
+version = "1.1.0"
 description = "Суммаризатор тендерной документации: PDF с госзакупок → сумма контракта, сроки, требования, штрафы"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,6 +26,7 @@ ignore = [
     # Длинные строки в промптах и HTML-шаблоне разбивать вредно: теряется
     # читаемость самого текста, который и является содержимым.
     "E501",
+    "UP042",
 ]
 
 [tool.ruff.lint.per-file-ignores]

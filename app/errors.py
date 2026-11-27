@@ -49,3 +49,23 @@ class ProviderNotConfiguredError(AppError):
 class ProviderUnavailableError(AppError):
     status_code = 502
     code = "provider_unavailable"
+
+
+class PdfTooComplexError(AppError):
+    status_code = 422
+    code = "pdf_too_complex"
+
+
+class TooManyPagesError(AppError):
+    status_code = 413
+    code = "too_many_pages"
+
+
+class ProviderOverrideForbiddenError(AppError):
+    status_code = 403
+    code = "provider_override_forbidden"
+
+
+class ServerBusyError(AppError):
+    status_code = 503
+    code = "server_busy"

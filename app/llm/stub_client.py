@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from app.core.heuristics import heuristic_summary
 from app.llm.base import LLMClient, LLMRequest, LLMResult
+from app.schemas import TenderSummary
 
 
 class StubClient(LLMClient):
@@ -32,3 +33,6 @@ class StubClient(LLMClient):
             completion_tokens=None,
             meta={"mode": "heuristic"},
         )
+
+    def summarize_document(self, marked_text: str) -> TenderSummary | None:
+        return heuristic_summary(marked_text)

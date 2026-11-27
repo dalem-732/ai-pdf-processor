@@ -200,6 +200,10 @@ class LLMUsage(BaseModel):
     calls: int
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    truncated_responses: int = Field(
+        default=0,
+        description="Сколько ответов модели оборвалось на лимите выходных токенов",
+    )
 
 
 class SummarizeResponse(BaseModel):
@@ -219,6 +223,9 @@ class HealthResponse(BaseModel):
     model: str
     provider_ready: bool
     detail: str | None = None
+    auth_required: bool = False
+    provider_override_allowed: bool = False
+    max_upload_mb: int | None = None
 
 
 class ErrorResponse(BaseModel):

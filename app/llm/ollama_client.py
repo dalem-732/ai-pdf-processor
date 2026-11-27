@@ -7,15 +7,16 @@
 
 from __future__ import annotations
 
-from app.llm.base import LLMClient, LLMError, LLMRequest, LLMResult
+from app.llm.base import LLMClient, LLMRequest, LLMResult
 
 
 class OllamaClient(LLMClient):
     name = "ollama"
 
-    def __init__(self, *, base_url: str, **kwargs: object) -> None:
+    def __init__(self, *, base_url: str, num_ctx: int = 8192, **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self._base_url = base_url.rstrip("/")
+        self.num_ctx = num_ctx
 
     async def complete(self, request: LLMRequest) -> LLMResult:
         payload = {
@@ -27,9 +28,7 @@ class OllamaClient(LLMClient):
             "options": {
                 "temperature": self.temperature,
                 "num_predict": self.max_output_tokens,
-                # Документация тендера длинная: контекст по умолчанию (2048)
-                # обрезал бы половину чанка.
-                "num_ctx": 8192,
+                "num_ctx": self.num_ctx,
             },
             "messages": [
                 {"role": "system", "content": request.system},
@@ -41,11 +40,12 @@ class OllamaClient(LLMClient):
         try:
             text = data["message"]["content"] or ""
         except (KeyError, TypeError) as exc:
-            raise LLMError(f"Неожиданная структура ответа Ollama: {data}") from exc
+            raise self._unexpected_structure("Ollama", data) from exc
 
         return LLMResult(
             text=text,
             prompt_tokens=data.get("prompt_eval_count"),
             completion_tokens=data.get("eval_count"),
             meta={"done_reason": data.get("done_reason")},
+            truncated=data.get("done_reason") == "length",
         )
