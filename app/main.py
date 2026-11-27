@@ -13,16 +13,19 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
-import uuid
-from collections.abc import AsyncIterator
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from app import __version__
 from app.config import LLMProvider, Settings, get_settings
@@ -31,23 +34,126 @@ from app.errors import (
     AppError,
     FileTooLargeError,
     ProviderNotConfiguredError,
+    ProviderOverrideForbiddenError,
     ProviderUnavailableError,
+    ServerBusyError,
     UnsupportedFileError,
 )
 from app.llm import build_client
 from app.llm.base import LLMError
+from app.middleware import (
+    RequestGuardMiddleware,
+    content_security_policy,
+    new_request_id,
+    script_hash,
+)
 from app.schemas import ErrorResponse, HealthResponse, SummarizeResponse
 from app.web import UPLOAD_PAGE_HTML
 
 logger = logging.getLogger(__name__)
 
-REQUEST_ID_HEADER = "X-Request-ID"
 ALLOWED_CONTENT_TYPES = frozenset(
     {"application/pdf", "application/x-pdf", "application/octet-stream", ""}
 )
-# Читаем загрузку порциями, чтобы отклонить слишком большой файл, не подняв
-# его целиком в память.
 UPLOAD_READ_CHUNK = 1024 * 1024
+INTERNAL_ERROR_DETAIL = "Внутренняя ошибка сервиса. Подробности в логах сервера по request_id"
+
+SUMMARIZE_RESPONSES: dict[int | str, dict[str, object]] = {
+    401: {"model": ErrorResponse, "description": "Нужен API-ключ (если задан TENDER_API_KEY)"},
+    403: {"model": ErrorResponse, "description": "Переопределение провайдера запрещено"},
+    413: {"model": ErrorResponse, "description": "Файл или число страниц превышают лимит"},
+    415: {"model": ErrorResponse, "description": "Ожидается PDF"},
+    422: {
+        "model": ErrorResponse,
+        "description": "PDF не читается, слишком сложный или в нём нет текстового слоя",
+    },
+    429: {"model": ErrorResponse, "description": "Превышен лимит запросов"},
+    502: {"model": ErrorResponse, "description": "Провайдер LLM недоступен"},
+    503: {"model": ErrorResponse, "description": "Провайдер не настроен или сервис занят"},
+}
+
+
+@dataclass(slots=True)
+class SummarizeForm:
+    file: UploadFile
+    provider: LLMProvider | None
+    max_chunks: int | None
+
+
+def summarize_form(
+    file: Annotated[UploadFile, File(description="PDF тендерной документации")],
+    provider: Annotated[
+        LLMProvider | None,
+        Form(
+            description=(
+                "Переопределить провайдера LLM для этого запроса "
+                "(только при TENDER_ALLOW_PROVIDER_OVERRIDE=true)"
+            )
+        ),
+    ] = None,
+    max_chunks: Annotated[
+        int | None,
+        Form(
+            ge=1,
+            le=200,
+            description="Ограничение числа фрагментов (не больше TENDER_MAX_CHUNKS)",
+        ),
+    ] = None,
+) -> SummarizeForm:
+    return SummarizeForm(file=file, provider=provider, max_chunks=max_chunks)
+
+
+class JobSlots:
+    """Неблокирующий лимит одновременно обрабатываемых документов."""
+
+    def __init__(self) -> None:
+        self.active = 0
+
+    def acquire(self, limit: int) -> Callable[[], None]:
+        if self.active >= limit:
+            raise ServerBusyError(
+                "Сервис обрабатывает максимум документов одновременно, повторите позже"
+            )
+        self.active += 1
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                self.active -= 1
+
+        return release
+
+
+@dataclass(slots=True)
+class SummarizeJob:
+    content: bytes
+    filename: str
+    settings: Settings
+    request_id: str
+
+    async def run(self, progress: ProgressCallback | None = None) -> SummarizeResponse:
+        return await _execute_summarize(
+            content=self.content,
+            filename=self.filename,
+            effective=self.settings,
+            request_id=self.request_id,
+            progress=progress,
+        )
+
+
+def _resolve_settings(app: FastAPI) -> Settings:
+    return app.dependency_overrides.get(get_settings, get_settings)()
+
+
+def _page_script() -> str:
+    match = re.search(r"<script>(.*?)</script>", UPLOAD_PAGE_HTML, re.DOTALL)
+    return match.group(1) if match else ""
+
+
+def _request_id(request: Request) -> str:
+    return getattr(request.state, "request_id", None) or new_request_id()
 
 
 def create_app() -> FastAPI:
@@ -71,32 +177,30 @@ def create_app() -> FastAPI:
             "текстом и возвращает структурированный JSON."
         ),
     )
+    app.state.jobs = JobSlots()
+    app.add_middleware(
+        RequestGuardMiddleware,
+        settings_provider=lambda: _resolve_settings(app),
+        page_csp=content_security_policy([script_hash(_page_script())]),
+    )
 
-    @app.middleware("http")
-    async def request_id_middleware(request: Request, call_next):
-        request_id = request.headers.get(REQUEST_ID_HEADER) or uuid.uuid4().hex[:12]
-        request.state.request_id = request_id
-        response = await call_next(request)
-        response.headers[REQUEST_ID_HEADER] = request_id
-        return response
+    def error_response(request: Request, status: int, code: str, detail: str) -> JSONResponse:
+        payload = ErrorResponse(error=code, detail=detail, request_id=_request_id(request))
+        return JSONResponse(status_code=status, content=payload.model_dump())
 
     @app.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
-        payload = ErrorResponse(
-            error=exc.code,
-            detail=exc.detail,
-            request_id=getattr(request.state, "request_id", None),
-        )
-        return JSONResponse(status_code=exc.status_code, content=payload.model_dump())
+        return error_response(request, exc.status_code, exc.code, exc.detail)
 
     @app.exception_handler(LLMError)
     async def llm_error_handler(request: Request, exc: LLMError) -> JSONResponse:
-        payload = ErrorResponse(
-            error="provider_error",
-            detail=str(exc),
-            request_id=getattr(request.state, "request_id", None),
-        )
-        return JSONResponse(status_code=502, content=payload.model_dump())
+        logger.warning("request_id=%s ошибка провайдера: %s", _request_id(request), exc)
+        return error_response(request, 502, "provider_error", exc.public_message)
+
+    @app.exception_handler(Exception)
+    async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
+        logger.exception("request_id=%s необработанная ошибка", _request_id(request))
+        return error_response(request, 500, "internal_error", INTERNAL_ERROR_DETAIL)
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def index() -> HTMLResponse:
@@ -120,151 +224,119 @@ def create_app() -> FastAPI:
             model=settings.active_model,
             provider_ready=problem is None,
             detail=problem,
+            auth_required=settings.auth_required,
+            provider_override_allowed=settings.allow_provider_override,
+            max_upload_mb=settings.max_upload_mb,
         )
 
     @app.post(
         "/api/v1/summarize",
         response_model=SummarizeResponse,
         tags=["summarize"],
-        responses={
-            413: {"model": ErrorResponse, "description": "Файл превышает лимит"},
-            415: {"model": ErrorResponse, "description": "Ожидается PDF"},
-            422: {
-                "model": ErrorResponse,
-                "description": "PDF не читается или в нём нет текстового слоя",
-            },
-            502: {"model": ErrorResponse, "description": "Провайдер LLM недоступен"},
-            503: {"model": ErrorResponse, "description": "Провайдер LLM не настроен"},
-        },
+        responses=SUMMARIZE_RESPONSES,
     )
     async def summarize(
         request: Request,
         settings: Annotated[Settings, Depends(get_settings)],
-        file: Annotated[UploadFile, File(description="PDF тендерной документации")],
-        provider: Annotated[
-            LLMProvider | None,
-            Form(description="Переопределить провайдера LLM для этого запроса"),
-        ] = None,
-        max_chunks: Annotated[
-            int | None,
-            Form(ge=1, le=200, description="Ограничение числа фрагментов документа"),
-        ] = None,
+        form: Annotated[SummarizeForm, Depends(summarize_form)],
     ) -> SummarizeResponse:
-        request_id = getattr(request.state, "request_id", uuid.uuid4().hex[:12])
-        _validate_upload_metadata(file)
-        effective = _effective_settings(settings, provider, max_chunks)
-        content = await _read_upload(file, effective.max_upload_bytes)
-        return await _execute_summarize(
-            content=content,
-            filename=file.filename or "document.pdf",
-            effective=effective,
-            request_id=request_id,
-        )
+        job = await _prepare_job(request, settings, form)
+        release = request.app.state.jobs.acquire(job.settings.max_concurrent_jobs)
+        try:
+            return await job.run()
+        finally:
+            release()
 
     @app.post(
         "/api/v1/summarize/stream",
         tags=["summarize"],
-        include_in_schema=True,
-        responses={
-            413: {"model": ErrorResponse, "description": "Файл превышает лимит"},
-            415: {"model": ErrorResponse, "description": "Ожидается PDF"},
-            422: {
-                "model": ErrorResponse,
-                "description": "PDF не читается или в нём нет текстового слоя",
-            },
-            502: {"model": ErrorResponse, "description": "Провайдер LLM недоступен"},
-            503: {"model": ErrorResponse, "description": "Провайдер LLM не настроен"},
-        },
+        responses=SUMMARIZE_RESPONSES,
     )
     async def summarize_stream(
         request: Request,
         settings: Annotated[Settings, Depends(get_settings)],
-        file: Annotated[UploadFile, File(description="PDF тендерной документации")],
-        provider: Annotated[
-            LLMProvider | None,
-            Form(description="Переопределить провайдера LLM для этого запроса"),
-        ] = None,
-        max_chunks: Annotated[
-            int | None,
-            Form(ge=1, le=200, description="Ограничение числа фрагментов документа"),
-        ] = None,
+        form: Annotated[SummarizeForm, Depends(summarize_form)],
     ) -> StreamingResponse:
-        request_id = getattr(request.state, "request_id", uuid.uuid4().hex[:12])
-        _validate_upload_metadata(file)
-        effective = _effective_settings(settings, provider, max_chunks)
-        content = await _read_upload(file, effective.max_upload_bytes)
-
-        async def event_stream() -> AsyncIterator[str]:
-            queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
-
-            async def on_progress(
-                percent: int, stage: str, detail: str | None = None
-            ) -> None:
-                await queue.put(
-                    {
-                        "type": "progress",
-                        "percent": percent,
-                        "stage": stage,
-                        "detail": detail,
-                    }
-                )
-
-            async def run() -> None:
-                try:
-                    payload = await _execute_summarize(
-                        content=content,
-                        filename=file.filename or "document.pdf",
-                        effective=effective,
-                        request_id=request_id,
-                        progress=on_progress,
-                    )
-                    await queue.put(
-                        {"type": "done", "payload": payload.model_dump(mode="json")}
-                    )
-                except AppError as exc:
-                    await queue.put(
-                        {
-                            "type": "error",
-                            "status": exc.status_code,
-                            "error": exc.code,
-                            "detail": exc.detail,
-                            "request_id": request_id,
-                        }
-                    )
-                except LLMError as exc:
-                    await queue.put(
-                        {
-                            "type": "error",
-                            "status": 502,
-                            "error": "provider_error",
-                            "detail": str(exc),
-                            "request_id": request_id,
-                        }
-                    )
-                finally:
-                    await queue.put(None)
-
-            task = asyncio.create_task(run())
-            try:
-                while True:
-                    item = await queue.get()
-                    if item is None:
-                        break
-                    yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-            finally:
-                await task
-
+        job = await _prepare_job(request, settings, form)
+        release = request.app.state.jobs.acquire(job.settings.max_concurrent_jobs)
         return StreamingResponse(
-            event_stream(),
+            stream_events(job.run, job.request_id, release),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
             },
+            background=BackgroundTask(release),
         )
 
     return app
+
+
+async def stream_events(
+    runner: Callable[[ProgressCallback], Awaitable[SummarizeResponse]],
+    request_id: str,
+    release: Callable[[], None] | None = None,
+) -> AsyncIterator[str]:
+    """SSE-события прогресса; при обрыве соединения работа отменяется."""
+    queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
+
+    async def on_progress(percent: int, stage: str, detail: str | None = None) -> None:
+        await queue.put({"type": "progress", "percent": percent, "stage": stage, "detail": detail})
+
+    def error_event(status: int, code: str, detail: str) -> dict[str, object]:
+        return {
+            "type": "error",
+            "status": status,
+            "error": code,
+            "detail": detail,
+            "request_id": request_id,
+        }
+
+    async def run() -> None:
+        try:
+            payload = await runner(on_progress)
+            await queue.put({"type": "done", "payload": payload.model_dump(mode="json")})
+        except AppError as exc:
+            await queue.put(error_event(exc.status_code, exc.code, exc.detail))
+        except LLMError as exc:
+            logger.warning("request_id=%s ошибка провайдера: %s", request_id, exc)
+            await queue.put(error_event(502, "provider_error", exc.public_message))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("request_id=%s необработанная ошибка", request_id)
+            await queue.put(error_event(500, "internal_error", INTERNAL_ERROR_DETAIL))
+        finally:
+            queue.put_nowait(None)
+
+    task = asyncio.create_task(run())
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+    finally:
+        if not task.done():
+            task.cancel()
+            logger.info("request_id=%s клиент отключился, обработка отменена", request_id)
+        with contextlib.suppress(BaseException):
+            await task
+        if release is not None:
+            release()
+
+
+async def _prepare_job(request: Request, settings: Settings, form: SummarizeForm) -> SummarizeJob:
+    _validate_upload_metadata(form.file)
+    effective = _effective_settings(settings, form.provider, form.max_chunks)
+    content = await _read_upload(form.file, effective.max_upload_bytes)
+    return SummarizeJob(
+        content=content,
+        filename=form.file.filename or "document.pdf",
+        settings=effective,
+        request_id=_request_id(request),
+    )
 
 
 def _effective_settings(
@@ -273,10 +345,15 @@ def _effective_settings(
     max_chunks: int | None,
 ) -> Settings:
     overrides: dict[str, object] = {}
-    if provider is not None:
+    if provider is not None and provider is not settings.llm_provider:
+        if not settings.allow_provider_override:
+            raise ProviderOverrideForbiddenError(
+                "Переопределение провайдера отключено на сервере "
+                "(TENDER_ALLOW_PROVIDER_OVERRIDE=false)"
+            )
         overrides["llm_provider"] = provider
     if max_chunks is not None:
-        overrides["max_chunks"] = max_chunks
+        overrides["max_chunks"] = min(max_chunks, settings.max_chunks)
     if not overrides:
         return settings
     return settings.model_copy(update=overrides)
@@ -299,7 +376,7 @@ async def _execute_summarize(
     try:
         client = build_client(effective)
     except LLMError as exc:
-        raise ProviderNotConfiguredError(str(exc)) from exc
+        raise ProviderNotConfiguredError(exc.public_message) from exc
 
     try:
         result = await summarize_pdf(
@@ -311,7 +388,10 @@ async def _execute_summarize(
             progress=progress,
         )
     except LLMError as exc:
-        raise ProviderUnavailableError(str(exc)) from exc
+        logger.warning("request_id=%s ошибка провайдера: %s", request_id, exc)
+        raise ProviderUnavailableError(exc.public_message) from exc
+    finally:
+        await client.aclose()
 
     return SummarizeResponse(
         request_id=request_id,

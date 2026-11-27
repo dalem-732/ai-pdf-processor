@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
+_LITERAL_RE = re.compile(r"\b(?:None|True|False|NaN)\b")
+_LITERALS = {"None": "null", "True": "true", "False": "false", "NaN": "null"}
 
 
 class JsonParseError(ValueError):
@@ -109,13 +111,41 @@ def _largest_json_block(text: str) -> str | None:
 
 
 def _repair(text: str) -> str:
-    repaired = _TRAILING_COMMA_RE.sub(r"\1", text)
-    # Литералы Python/JS вместо JSON-совместимых значений.
-    repaired = re.sub(r"\bNone\b", "null", repaired)
-    repaired = re.sub(r"\bTrue\b", "true", repaired)
-    repaired = re.sub(r"\bFalse\b", "false", repaired)
-    repaired = re.sub(r"\bNaN\b", "null", repaired)
-    return repaired
+    """Починить литералы Python/JS и висячие запятые вне строковых значений."""
+    return "".join(
+        segment if is_string else _repair_segment(segment)
+        for segment, is_string in _split_strings(text)
+    )
+
+
+def _repair_segment(segment: str) -> str:
+    repaired = _TRAILING_COMMA_RE.sub(r"\1", segment)
+    return _LITERAL_RE.sub(lambda match: _LITERALS[match.group(0)], repaired)
+
+
+def _split_strings(text: str) -> list[tuple[str, bool]]:
+    segments: list[tuple[str, bool]] = []
+    start = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                segments.append((text[start : index + 1], True))
+                start = index + 1
+                in_string = False
+        elif char == '"':
+            if index > start:
+                segments.append((text[start:index], False))
+            start = index
+            in_string = True
+    if start < len(text):
+        segments.append((text[start:], in_string))
+    return segments
 
 
 def _close_unterminated(text: str) -> str:

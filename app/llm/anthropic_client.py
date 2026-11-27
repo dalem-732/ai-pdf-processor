@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from app.llm.base import LLMClient, LLMError, LLMRequest, LLMResult
+from app.llm.base import LLMClient, LLMRequest, LLMResult
 
 ANTHROPIC_API_VERSION = "2023-06-01"
 
@@ -64,7 +64,7 @@ class AnthropicClient(LLMClient):
                 block.get("text", "") for block in blocks if block.get("type") == "text"
             )
         except (KeyError, TypeError, AttributeError) as exc:
-            raise LLMError(f"Неожиданная структура ответа Anthropic: {data}") from exc
+            raise self._unexpected_structure("Anthropic", data) from exc
 
         if uses_prefill and not text.lstrip().startswith("{"):
             text = "{" + text
@@ -75,4 +75,5 @@ class AnthropicClient(LLMClient):
             prompt_tokens=usage.get("input_tokens"),
             completion_tokens=usage.get("output_tokens"),
             meta={"stop_reason": data.get("stop_reason")},
+            truncated=data.get("stop_reason") == "max_tokens",
         )
